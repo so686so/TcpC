@@ -31,93 +31,64 @@ void OnServerMessage( TcpClientContext* ctx, void* user_arg,
 {
     if( strncmp( target, "CHAT", TARGET_NAME_LEN ) == 0 )
     {
-        if( len < sizeof( ChatPacket ) ) return;
-
         ChatPacket* pkt = (ChatPacket*)body;
-        printf( ">> [%s] %s\n", pkt->sender_id, pkt->message );
+        printf( "\r>> [%s] %s\nMe: ", pkt->sender_id, pkt->message ); // 프롬프트 유지 꼼수
+        fflush( stdout );
     }
 }
 
 int main( int argc, char* argv[] )
 {
-    // 사용자 ID는 실행 인자로 받음 (식별용)
-    if( argc < 2 )
-    {
-        printf( "Usage: %s <UserID>\n", argv[0] );
-        return 0;
-    }
+    if( argc < 2 ) { printf("Usage: %s <UserID>\n", argv[0]); return 0; }
 
     char server_ip[32];
     int server_port;
 
-    // -----------------------------------------------------------
-    // 1. 서버 접속 정보 입력
-    // -----------------------------------------------------------
-    printf( "========================================\n" );
-    printf( "   TCP Client Launcher\n" );
-    printf( "========================================\n" );
+    printf( "Server IP: " ); scanf( "%31s", server_ip );
+    printf( "Server Port: " ); scanf( "%d", &server_port );
+    getchar(); // 버퍼 비우기
 
-    printf( "Server IP: " );
-    if( scanf( "%31s", server_ip ) != 1 ) return -1;
-
-    printf( "Server Port: " );
-    if( scanf( "%d", &server_port ) != 1 ) return -1;
-
-    // 입력 버퍼 비우기 (개행 문자 제거)
-    getchar();
-
-    printf( "----------------------------------------\n" );
-
-    // 2. 내 정보 설정
     MyClientApp myApp;
     strncpy( myApp.my_id, argv[1], 32 );
-    myApp.msg_sent_count = 0;
 
-    // 3. 클라이언트 생성
     TcpClientContext* client = CreateTcpClientContext( OnServerMessage, &myApp );
-    if( !client )
-    {
-        fprintf( stderr, "Client creation failed.\n" );
-        return -1;
-    }
 
-    // 4. 서버 연결
-    printf( "Connecting to %s:%d ...\n", server_ip, server_port );
+    // 1. 연결 시작 (백그라운드 스레드 가동)
+    printf( "Starting Network Manager... (Target: %s:%d)\n", server_ip, server_port );
+    client->Connect( client, server_ip, server_port );
 
-    if( !client->Connect( client, server_ip, server_port ) )
-    {
-        fprintf( stderr, "Connection failed.\n" );
-        client->Destroy( client );
-        return -1;
-    }
-
-    // 5. 로그인 패킷 전송
+    // 2. 로그인 패킷 전송 시도
+    // (연결될 때까지 기다렸다가 보내거나, 그냥 보내고 실패하면 사용자가 다시 입력하게 함.
+    //  여기서는 편의상 잠시 대기 후 자동 시도)
+    sleep( 1 );
     LoginReqPacket login;
     strncpy( login.user_id, myApp.my_id, 32 );
-    strcpy( login.password, "1234" );
-    login.version = 1;
-
     client->Send( client, "LOGIN", &login, sizeof( login ) );
 
-    // 6. 채팅 시뮬레이션 루프
-    printf( "[Info] Chat simulation started. Sending messages every 2 seconds.\n" );
+    // 3. 채팅 입력 루프
+    char input[128];
+    printf( "=== Chat Room (Type 'q' to quit) ===\n" );
 
-    for( int i = 0; i < 100; ++i )
+    while( 1 )
     {
+        printf( "Me: " );
+        if( fgets( input, sizeof( input ), stdin ) == NULL ) break;
+
+        input[strcspn(input, "\n")] = 0; // 엔터 제거
+        if( strcmp( input, "q" ) == 0 ) break;
+
         ChatPacket msg;
         strncpy( msg.sender_id, myApp.my_id, 32 );
-        sprintf( msg.message, "Hello Packet %d from %s", i, myApp.my_id );
-        msg.timestamp = (uint64_t)time( NULL );
+        strncpy( msg.message, input, 127 );
 
-        client->Send( client, "CHAT", &msg, sizeof( msg ) );
-
-        myApp.msg_sent_count++;
-        // printf( "[Sent] %s\n", msg.message ); // 로그가 너무 많으면 주석 처리
-
-        sleep( 2 ); // 2초 대기
+        // 전송 시도
+        int sent = client->Send( client, "CHAT", &msg, sizeof( msg ) );
+        if( sent < 0 )
+        {
+            printf( "[System] Not connected to server. Reconnecting...\n" );
+        }
     }
 
-    // 7. 종료
     client->Destroy( client );
     return 0;
 }
