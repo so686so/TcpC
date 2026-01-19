@@ -8,18 +8,19 @@
  * 3. Sender Thread: SendQueue Pop -> 패킷 직렬화 -> 암호화 -> 실제 전송(Send/Broadcast)
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/epoll.h>
-
 #include "TcpServer.h"
-#include "PacketUtils.h"
+#include "PacketUtils.h" // 패킷 파싱 및 직렬화 함수 사용
+
+#include <stdio.h>       // printf, perror (로그 및 에러 출력)
+#include <stdlib.h>      // malloc, free (태스크 및 컨텍스트 할당)
+#include <string.h>      // memset, memcpy, strncpy
+#include <unistd.h>      // close, fcntl (파일 디스크립터 제어)
+#include <fcntl.h>       // F_SETFL, O_NONBLOCK (Non-blocking 설정 매크로)
+#include <errno.h>       // errno, EINTR
+#include <arpa/inet.h>   // htons, INADDR_ANY (네트워크 주소 관련)
+#include <sys/socket.h>  // socket, bind, listen, accept, send, recv, setsockopt
+#include <sys/epoll.h>   // epoll_create1, epoll_ctl, epoll_wait
+
 
 // --------------------------------------------------------------------------
 // 1. 내부 구조체 정의 (ClientNode 은닉)
@@ -42,19 +43,21 @@ typedef struct ClientNode
 static void AddClient( TcpServerContext* ctx, int fd )
 {
     ClientNode* node = (ClientNode*)malloc( sizeof( ClientNode ) );
-    if( !node ) return;
 
-    node->fd = fd;
+    if( !node )
+        return;
+
+    node->fd   = fd;
     node->next = NULL;
 
     pthread_mutex_lock( &ctx->client_list_mutex );
     {
         node->next = ctx->client_list_head;
+
         ctx->client_list_head = node;
         ctx->current_client_count++;
     }
     pthread_mutex_unlock( &ctx->client_list_mutex );
-    printf("[AddClient] FD : %d\n", fd);
 }
 
 /**
@@ -71,11 +74,12 @@ static void RemoveClient( TcpServerContext* ctx, int fd )
         {
             if( curr->fd == fd )
             {
-                if( prev == NULL ) ctx->client_list_head = curr->next;
-                else prev->next = curr->next;
+                if( prev == NULL ) { ctx->client_list_head = curr->next; }
+                else               { prev->next = curr->next; }
 
                 free( curr );
                 ctx->current_client_count--;
+
                 break;
             }
             prev = curr;
@@ -83,7 +87,6 @@ static void RemoveClient( TcpServerContext* ctx, int fd )
         }
     }
     pthread_mutex_unlock( &ctx->client_list_mutex );
-    printf("[RemoveClient] FD : %d\n", fd);
 }
 
 
@@ -97,6 +100,7 @@ static void SetNonBlocking( int fd )
     fcntl( fd, F_SETFL, flags | O_NONBLOCK );
 }
 
+
 // --------------------------------------------------------------------------
 // 4. 큐 데이터 해제 콜백 (SafeQueue_Destroy용)
 // --------------------------------------------------------------------------
@@ -106,7 +110,8 @@ static void FreeRecvTask( void* data )
     ServerRecvTask* task = (ServerRecvTask*)data;
     if( task )
     {
-        if( task->data ) free( task->data );
+        if( task->data )
+            free( task->data );
         free( task );
     }
 }
@@ -116,7 +121,8 @@ static void FreeSendTask( void* data )
     ServerSendTask* task = (ServerSendTask*)data;
     if( task )
     {
-        if( task->body_data ) free( task->body_data );
+        if( task->body_data )
+            free( task->body_data );
         free( task );
     }
 }
@@ -124,7 +130,7 @@ static void FreeSendTask( void* data )
 
 // --------------------------------------------------------------------------
 // 5. 워커 스레드 (Worker Thread)
-// 설명: 수신된 Raw 데이터를 파싱하고 사용자 콜백을 호출한다.
+//    수신된 Raw 데이터를 파싱하고 사용자 콜백을 호출한다.
 // --------------------------------------------------------------------------
 
 static void* WorkerThreadFunc( void* arg )
@@ -140,28 +146,31 @@ static void* WorkerThreadFunc( void* arg )
         // task가 NULL이거나, fd가 -1인 경우 종료로 간주
         if( !task || task->client_fd == -1 )
         {
-            if( task ) FreeRecvTask( task );
+            if( task )
+                FreeRecvTask( task );
+
             break;
         }
 
         // 3. 패킷 파싱
-        char target_buf[TARGET_NAME_LEN + 1];
+        char  target_buf[TARGET_NAME_LEN];
         char* body_ptr = NULL;
-        int body_len = 0;
+        int   body_len = 0;
 
         // In-place decryption을 위해 task->data(힙 메모리)를 바로 넘김
-        PacketResult result = Packet_Parse( task->data, task->len,
-                                            ctx->decrypt_fn,
-                                            target_buf,
-                                            &body_ptr, &body_len );
+        PacketResult result
+            = Packet_Parse( task->data, task->len, ctx->decrypt_fn,
+                            target_buf, &body_ptr, &body_len );
 
         if( result == PKT_SUCCESS )
         {
             // 4. 사용자 콜백 호출 (비즈니스 로직)
             if( ctx->on_message )
             {
-                ctx->on_message( ctx, task->client_fd, ctx->user_arg,
-                                 target_buf, body_ptr, body_len );
+                ctx->on_message(
+                    ctx, task->client_fd, ctx->service_ctx,
+                    target_buf, body_ptr, body_len
+                );
             }
         }
         else
@@ -189,7 +198,8 @@ static void* SenderThreadFunc( void* arg )
 
     // 직렬화용 임시 버퍼 (스레드 로컬)
     char* send_buf = (char*)malloc( DEFAULT_BUF_SIZE );
-    if( !send_buf ) return NULL;
+    if( !send_buf )
+        return NULL;
 
     while( ctx->is_running )
     {
@@ -199,15 +209,15 @@ static void* SenderThreadFunc( void* arg )
         // 2. 종료 신호 확인 (-2: Sender 종료 코드)
         if( !task || task->client_fd == -2 )
         {
-            if( task ) FreeSendTask( task );
+            if( task )
+                FreeSendTask( task );
             break;
         }
 
         // 3. 패킷 직렬화 (암호화 포함)
-        int packet_len = Packet_Serialize( send_buf, DEFAULT_BUF_SIZE,
-                                           task->target,
-                                           task->body_data, task->body_len,
-                                           ctx->encrypt_fn );
+        int packet_len
+            = Packet_Serialize( send_buf, DEFAULT_BUF_SIZE, task->target,
+                                task->body_data, task->body_len, ctx->encrypt_fn );
 
         if( packet_len > 0 )
         {
@@ -249,15 +259,18 @@ static void* SenderThreadFunc( void* arg )
 
 static bool impl_Server_Init( TcpServerContext* ctx, int port )
 {
-    if( !ctx ) return false;
+    if( !ctx )
+        return false;
 
     // Epoll 생성
     ctx->epoll_fd = epoll_create1( 0 );
-    if( ctx->epoll_fd < 0 ) return false;
+    if( ctx->epoll_fd < 0 )
+        return false;
 
     // Listen 소켓 생성
     ctx->listen_fd = socket( AF_INET, SOCK_STREAM, 0 );
-    if( ctx->listen_fd < 0 ) return false;
+    if( ctx->listen_fd < 0 )
+        return false;
 
     // 주소 재사용 옵션 (서버 재시작 시 Bind Error 방지)
     int opt = 1;
@@ -266,9 +279,10 @@ static bool impl_Server_Init( TcpServerContext* ctx, int port )
     // 바인딩
     struct sockaddr_in addr;
     memset( &addr, 0, sizeof( addr ) );
-    addr.sin_family = AF_INET;
+
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons( port );
+    addr.sin_port        = htons( port );
 
     if( bind( ctx->listen_fd, (struct sockaddr*)&addr, sizeof( addr ) ) < 0 )
     {
@@ -287,8 +301,9 @@ static bool impl_Server_Init( TcpServerContext* ctx, int port )
 
     // Epoll에 Listen 소켓 등록
     struct epoll_event ev;
-    ev.events = EPOLLIN; // 읽기 이벤트 감지
+    ev.events  = EPOLLIN; // 읽기 이벤트 감지
     ev.data.fd = ctx->listen_fd;
+
     if( epoll_ctl( ctx->epoll_fd, EPOLL_CTL_ADD, ctx->listen_fd, &ev ) < 0 )
     {
         perror( "[TcpServer] Epoll control failed" );
@@ -304,15 +319,13 @@ static bool impl_Server_Init( TcpServerContext* ctx, int port )
 
 static void impl_Server_Run( TcpServerContext* ctx, volatile bool* exit_flag )
 {
-    if( !ctx ) return;
+    if( !ctx )
+        return;
 
     ctx->is_running = true;
 
     // 1. 워커 스레드 생성
-    for( int i = 0; i < ctx->worker_count; ++i )
-    {
-        pthread_create( &ctx->worker_threads[i], NULL, WorkerThreadFunc, ctx );
-    }
+    pthread_create( &ctx->worker_thread, NULL, WorkerThreadFunc, ctx );
 
     // 2. 송신 스레드 생성
     pthread_create( &ctx->sender_thread, NULL, SenderThreadFunc, ctx );
@@ -334,8 +347,8 @@ static void impl_Server_Run( TcpServerContext* ctx, volatile bool* exit_flag )
 
         if( n_fds < 0 )
         {
-            if( errno == EINTR ) continue; // 시그널 인터럽트는 무시
-            perror( "[TcpServer] Epoll wait error" );
+            // 시그널 인터럽트는 무시
+            if( errno == EINTR ) continue;
             break;
         }
 
@@ -354,33 +367,41 @@ static void impl_Server_Run( TcpServerContext* ctx, volatile bool* exit_flag )
                 {
                     SetNonBlocking( client_fd );
 
-                    // Epoll 등록 (Edge Triggered)
                     struct epoll_event ev;
-                    ev.events = EPOLLIN | EPOLLET;
+                    ev.events  = EPOLLIN | EPOLLET;
                     ev.data.fd = client_fd;
+
                     epoll_ctl( ctx->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev );
 
-                    // 내부 리스트에 추가
                     AddClient( ctx, client_fd );
 
-                    // [핸드셰이크] 암호화 정보 전송 (요구사항 5번)
-                    // 현재는 단순 문자열 전송. 실제로는 패킷 포맷을 맞춰 보내기도 함.
-                    const char* handshake_msg = "ENC:XOR";
-                    send( client_fd, handshake_msg, strlen( handshake_msg ), 0 );
+                    // 핸드셰이크 전송 (평문, XOR 통보)
+                    SecurityStrategyBody strat_body;
+                    strat_body.strategy_code = SEC_STRATEGY_XOR;
 
-                    printf( "[TcpServer] Client %d connected.\n", client_fd );
+                    // 직렬화용 임시 버퍼
+                    char hs_buf[DEFAULT_BUF_SIZE];
+
+                    // 암호화 함수 인자에 NULL 전달 -> 평문 헤더+바디 생성
+                    int hs_len
+                        = Packet_Serialize( hs_buf, DEFAULT_BUF_SIZE, TARGET_SEC_STRATEGY,
+                                            &strat_body, sizeof(SecurityStrategyBody), NULL /* 평문 */ );
+
+                    if( hs_len > 0 ){
+                        send( client_fd, hs_buf, hs_len, MSG_NOSIGNAL );
+                    }
+
+                    printf( "[TcpServer] Client %d connected. Handshake sent (Strategy: XOR).\n", client_fd );
                 }
             }
             // [Case B] 데이터 수신 (From Client)
             else
             {
-                // Edge Triggered 모드이므로 루프를 돌며 다 읽거나,
-                // 여기서는 단순화하여 버퍼 크기만큼 읽음. (실제 상용에선 RingBuffer 필수)
                 char* temp_buf = (char*)malloc( DEFAULT_BUF_SIZE );
-                if( !temp_buf ) continue;
+                if( !temp_buf )
+                    continue;
 
                 int len = recv( curr_fd, temp_buf, DEFAULT_BUF_SIZE, 0 );
-
                 if( len > 0 )
                 {
                     // 수신된 데이터를 Task로 포장하여 RecvQueue로 전달
@@ -388,20 +409,17 @@ static void impl_Server_Run( TcpServerContext* ctx, volatile bool* exit_flag )
                     if( task )
                     {
                         task->client_fd = curr_fd;
-                        task->data = temp_buf; // 메모리 소유권 이전
-                        task->len = len;
+                        task->data      = temp_buf; // 메모리 소유권 이전
+                        task->len       = len;
 
                         // 큐가 가득 찼으면 Drop (Backpressure)
                         if( !SafeQueue_Enqueue( ctx->recv_queue, task ) )
                         {
-                            printf( "[TcpServer] RecvQueue Full! Dropping packet from %d\n", curr_fd );
+                            // printf( "[TcpServer] RecvQueue Full! Dropping packet from %d\n", curr_fd );
                             FreeRecvTask( task ); // task와 data 모두 해제됨
                         }
                     }
-                    else
-                    {
-                        free( temp_buf );
-                    }
+                    else { free( temp_buf ); }
                 }
                 else
                 {
@@ -419,14 +437,18 @@ static void impl_Server_Run( TcpServerContext* ctx, volatile bool* exit_flag )
 
 static bool impl_Server_Send( TcpServerContext* ctx, int client_fd, const char* target, void* body, int len )
 {
-    if( !ctx || !ctx->is_running ) return false;
+    if( !ctx || !ctx->is_running )
+        return false;
 
     // SendTask 생성
     ServerSendTask* task = (ServerSendTask*)malloc( sizeof( ServerSendTask ) );
-    if( !task ) return false;
 
-    task->client_fd = client_fd;
+    if( !task )
+        return false;
+
+    task->client_fd    = client_fd;
     task->is_broadcast = false;
+
     memset( task->target, 0, TARGET_NAME_LEN );
     if( target ) strncpy( task->target, target, TARGET_NAME_LEN );
 
@@ -459,13 +481,17 @@ static bool impl_Server_Send( TcpServerContext* ctx, int client_fd, const char* 
 
 static bool impl_Server_Broadcast( TcpServerContext* ctx, const char* target, void* body, int len )
 {
-    if( !ctx || !ctx->is_running ) return false;
+    if( !ctx || !ctx->is_running )
+        return false;
 
     ServerSendTask* task = (ServerSendTask*)malloc( sizeof( ServerSendTask ) );
-    if( !task ) return false;
 
-    task->client_fd = -1; // Broadcast에서는 무시됨
+    if( !task )
+        return false;
+
+    task->client_fd    = -1; // Broadcast에서는 무시됨
     task->is_broadcast = true;
+
     memset( task->target, 0, TARGET_NAME_LEN );
     if( target ) strncpy( task->target, target, TARGET_NAME_LEN );
 
@@ -510,39 +536,29 @@ static void impl_Server_Destroy( TcpServerContext* ctx )
 
     ctx->is_running = false; // 루프 종료 플래그
 
-    // 1. 스레드 종료 신호 전송 (Poison Pill)
-
-    // 모든 워커를 깨우기 위해 워커 수만큼 종료 태스크 삽입
-    for( int i = 0; i < ctx->worker_count; ++i )
-    {
-        ServerRecvTask* poison = (ServerRecvTask*)malloc( sizeof( ServerRecvTask ) );
-        if( poison )
-        {
-            poison->client_fd = -1; // 종료 코드
-            poison->data = NULL;
-            SafeQueue_Enqueue( ctx->recv_queue, poison );
-        }
+    // 1. 워커 스레드 종료 신호
+    ServerRecvTask* poison_for_worker = (ServerRecvTask*)malloc( sizeof( ServerRecvTask ) );
+    if( poison_for_worker ){
+        poison_for_worker->client_fd = -1;
+        poison_for_worker->data = NULL;
+        SafeQueue_Enqueue( ctx->recv_queue, poison_for_worker );
     }
 
-    // 송신 스레드용 종료 태스크
-    ServerSendTask* poison_send = (ServerSendTask*)malloc( sizeof( ServerSendTask ) );
-    if( poison_send )
-    {
-        poison_send->client_fd = -2; // 종료 코드
-        poison_send->body_data = NULL;
-        SafeQueue_Enqueue( ctx->send_queue, poison_send );
+    // 2. 송신 스레드용 종료 태스크
+    ServerSendTask* poison_for_sender = (ServerSendTask*)malloc( sizeof( ServerSendTask ) );
+    if( poison_for_sender ){
+        poison_for_sender->client_fd = -2; // 종료 코드
+        poison_for_sender->body_data = NULL;
+        SafeQueue_Enqueue( ctx->send_queue, poison_for_sender );
     }
 
-    // 2. 스레드 종료 대기 (Join)
-    for( int i = 0; i < ctx->worker_count; ++i )
-    {
-        pthread_join( ctx->worker_threads[i], NULL );
-    }
+    // 3. 스레드 종료 대기 (Join)
+    pthread_join( ctx->worker_thread, NULL );
     pthread_join( ctx->sender_thread, NULL );
 
-    // 3. 자원 해제
+    // 4. 자원 해제
     if( ctx->listen_fd >= 0 ) close( ctx->listen_fd );
-    if( ctx->epoll_fd >= 0 ) close( ctx->epoll_fd );
+    if( ctx->epoll_fd  >= 0 ) close( ctx->epoll_fd  );
 
     // 큐 파괴 (SafeQueue_Destroy가 내부 데이터까지 FreeRecvTask/FreeSendTask 호출로 정리함)
     SafeQueue_Destroy( ctx->recv_queue, FreeRecvTask );
@@ -561,12 +577,10 @@ static void impl_Server_Destroy( TcpServerContext* ctx )
         }
         ctx->client_list_head = NULL;
     }
-    pthread_mutex_unlock( &ctx->client_list_mutex );
+    pthread_mutex_unlock ( &ctx->client_list_mutex );
     pthread_mutex_destroy( &ctx->client_list_mutex );
 
     if( ctx->events ) free( ctx->events );
-    if( ctx->worker_threads ) free( ctx->worker_threads );
-
     free( ctx );
 
     printf( "[TcpServer] Destroyed successfully.\n" );
@@ -584,54 +598,41 @@ static int impl_GetClientCount( TcpServerContext* ctx )
 // 8. 생성자 구현
 // --------------------------------------------------------------------------
 
-TcpServerContext* CreateTcpServerContext( OnServerMessageCallback callback, void* user_arg, int worker_count )
+TcpServerContext* CreateTcpServerContext( OnServerMessageCallback callback, void* service_ctx )
 {
     TcpServerContext* ctx = (TcpServerContext*)malloc( sizeof( TcpServerContext ) );
-    if( !ctx ) return NULL;
+
+    if( !ctx )
+        return NULL;
 
     memset( ctx, 0, sizeof( TcpServerContext ) );
 
-    // 기본값 설정
-    ctx->listen_fd = -1;
-    ctx->epoll_fd = -1;
-    ctx->on_message = callback;
-    ctx->user_arg = user_arg;
-    ctx->worker_count = ( worker_count > 0 ) ? worker_count : DEFAULT_WORKER_NUM;
+    ctx->listen_fd            = -1;
+    ctx->epoll_fd             = -1;
+    ctx->on_message           = callback;
+    ctx->service_ctx          = service_ctx;
     ctx->current_client_count = 0;
 
-    // 클라이언트 리스트 초기화
     ctx->client_list_head = NULL;
-    if( pthread_mutex_init( &ctx->client_list_mutex, NULL ) != 0 )
-    {
-        free( ctx );
-        return NULL;
-    }
+    pthread_mutex_init( &ctx->client_list_mutex, NULL );
 
-    // 전략 설정 (기본값)
     ctx->encrypt_fn = Packet_DefaultXor;
     ctx->decrypt_fn = Packet_DefaultXor;
 
-    // 큐 생성
     ctx->recv_queue = SafeQueue_Create( QUEUE_CAPACITY );
     ctx->send_queue = SafeQueue_Create( QUEUE_CAPACITY );
 
-    if( !ctx->recv_queue || !ctx->send_queue )
-    {
-        // 큐 생성 실패 시 정리 (상세 구현 생략)
+    if( !ctx->recv_queue || !ctx->send_queue ){
         free( ctx );
         return NULL;
     }
 
-    // 스레드 배열 할당
-    ctx->worker_threads = (pthread_t*)malloc( sizeof( pthread_t ) * ctx->worker_count );
-
-    // 함수 바인딩
-    ctx->Init = impl_Server_Init;
-    ctx->Run = impl_Server_Run;
-    ctx->Send = impl_Server_Send;
-    ctx->Broadcast = impl_Server_Broadcast;
-    ctx->SetStrategy = impl_Server_SetStrategy;
-    ctx->Destroy = impl_Server_Destroy;
+    ctx->Init           = impl_Server_Init;
+    ctx->Run            = impl_Server_Run;
+    ctx->Send           = impl_Server_Send;
+    ctx->Broadcast      = impl_Server_Broadcast;
+    ctx->SetStrategy    = impl_Server_SetStrategy;
+    ctx->Destroy        = impl_Server_Destroy;
     ctx->GetClientCount = impl_GetClientCount;
 
     return ctx;

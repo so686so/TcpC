@@ -10,19 +10,18 @@
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
 
-#include <pthread.h>
-#include <sys/epoll.h>
+#include "CommonDef.h" // 공통 타입 정의
+#include "SafeQueue.h" // SafeQueue 구조체 및 함수 사용
 
-#include "CommonDef.h"
-#include "SafeQueue.h"
+#include <pthread.h>   // pthread_t, pthread_mutex_t
+#include <sys/epoll.h> // epoll_event 구조체, epoll_* 함수 관련 타입
 
 // --------------------------------------------------------------------------
 // 1. 상수 및 설정 정의
 // --------------------------------------------------------------------------
 
-#define MAX_EPOLL_EVENTS    100   // 한 번의 epoll_wait에서 처리할 최대 이벤트 수
-#define DEFAULT_WORKER_NUM  4     // 기본 워커 스레드 개수
-#define QUEUE_CAPACITY      1000  // 큐 최대 크기 (Backpressure 방지)
+#define MAX_EPOLL_EVENTS 100  // 한 번의 epoll_wait에서 처리할 최대 이벤트 수
+#define QUEUE_CAPACITY   1000 // 큐 최대 크기 (Backpressure 방지)
 
 // --------------------------------------------------------------------------
 // 2. 내부 태스크 구조체 및 전방 선언
@@ -32,28 +31,26 @@
 struct ClientNode;
 
 /**
- * ## [ServerRecvTask]
  * IO 스레드(Epoll)가 수신한 데이터를 워커 스레드로 넘길 때 사용하는 구조체
  */
 typedef struct
 {
-    int client_fd;          // 데이터를 보낸 클라이언트 소켓
-    char* data;             // 수신된 원본 데이터 (힙 할당됨, 워커가 해제해야 함)
-    int len;                // 데이터 길이
+    int   client_fd; // 데이터를 보낸 클라이언트 소켓
+    char* data;      // 수신된 원본 데이터 (힙 할당됨, 워커가 해제해야 함)
+    int   len;       // 데이터 길이
 } ServerRecvTask;
 
 /**
- * ## [ServerSendTask]
  * 워커 스레드가 처리를 마치고 송신 스레드로 넘길 때 사용하는 구조체
  */
 typedef struct
 {
-    int client_fd;          // 받을 대상 (-1이면 Broadcast, -2면 종료 신호)
-    bool is_broadcast;      // 브로드캐스트 여부
+    int  client_fd;    // 받을 대상 (-1이면 Broadcast, -2면 종료 신호)
+    bool is_broadcast; // 브로드캐스트 여부
 
-    char target[TARGET_NAME_LEN]; // 패킷 타겟 코드
-    char* body_data;        // 전송할 바디 데이터 (힙 할당됨, 송신자가 해제해야 함)
-    int body_len;           // 바디 길이
+    char  target[TARGET_NAME_LEN]; // 패킷 타겟 코드
+    char* body_data; // 전송할 바디 데이터 (힙 할당됨, 송신자가 해제해야 함)
+    int   body_len;  // 바디 길이
 } ServerSendTask;
 
 
@@ -66,16 +63,16 @@ typedef struct
  * 워커 스레드가 패킷을 파싱한 후 비즈니스 로직을 수행하기 위해 호출하는 콜백.
  *
  * ### [Params]
- * - srv_ctx   : 서버 컨텍스트 포인터
- * - client_fd : 메시지를 보낸 클라이언트의 소켓 FD
- * - user_arg  : 사용자 정의 데이터 (ServiceContext 등)
- * - target    : 패킷 타겟 코드 (예: "LOGIN")
- * - body      : 복호화된 바디 데이터 포인터
- * - len       : 바디 길이
+ * - srv_ctx     : 서버 컨텍스트 포인터
+ * - client_fd   : 메시지를 보낸 클라이언트의 소켓 FD
+ * - service_ctx : 사용자 정의 데이터 (ServiceContext 등)
+ * - target      : 패킷 타겟 코드 (예: "LOGIN")
+ * - body        : 복호화된 바디 데이터 포인터
+ * - len         : 바디 길이
  */
 typedef void ( *OnServerMessageCallback )( TcpServerContext* srv_ctx,
                                            int client_fd,
-                                           void* user_arg,
+                                           void* service_ctx,
                                            const char* target,
                                            const char* body, int len );
 
@@ -86,40 +83,35 @@ typedef void ( *OnServerMessageCallback )( TcpServerContext* srv_ctx,
 
 struct TcpServerContext
 {
+    volatile bool is_running; // 서버 가동 상태 플래그
+
     // --- [Network Core] ---
     int listen_fd;
     int epoll_fd;
-    struct epoll_event* events;  // Epoll 이벤트 버퍼
+    struct epoll_event* events; // Epoll 이벤트 버퍼
 
     // --- [Thread Management] ---
-    pthread_t* worker_threads;   // 워커 스레드 배열
-    int worker_count;            // 워커 스레드 수
-    pthread_t sender_thread;     // 송신 전담 스레드
-
-    volatile bool is_running;    // 서버 가동 상태 플래그
+    pthread_t worker_thread; // 작업 전담 스레드
+    pthread_t sender_thread; // 송신 전담 스레드
 
     // --- [Data Pipeline (Queues)] ---
-    SafeQueue* recv_queue;       // Epoll -> Worker (ServerRecvTask*)
-    SafeQueue* send_queue;       // Worker -> Sender (ServerSendTask*)
+    SafeQueue* recv_queue; // Epoll  -> Worker (ServerRecvTask*)
+    SafeQueue* send_queue; // Worker -> Sender (ServerSendTask*)
 
-    // --- [Client Management (Moved from Global)] ---
-    struct ClientNode* client_list_head; // 연결된 클라이언트 리스트 헤드
-    pthread_mutex_t client_list_mutex;   // 리스트 접근 동기화용 뮤텍스
-
-    volatile int current_client_count;
+    // --- [Client Management] ---
+    struct ClientNode* client_list_head;  // 연결된 클라이언트 리스트 헤드
+    pthread_mutex_t    client_list_mutex; // 리스트 접근 동기화용 뮤텍스
+    volatile int       current_client_count;
 
     // --- [User & Strategy] ---
-    void* user_arg;              // 콜백용 사용자 데이터
-    OnServerMessageCallback on_message;
+    void*                   service_ctx; // on_message 콜백에 전달할 사용자가 구성한 서비스의 컨텍스트
+    OnServerMessageCallback on_message;  // 수신 시 호출될 함수. 해당 함수에서 service_ctx 이용.
 
-    EncryptFunc encrypt_fn;      // 송신 패킷 암호화용
-    DecryptFunc decrypt_fn;      // 수신 패킷 복호화용
-
-
-    // --- [Member Methods] ---
+    EncryptFunc encrypt_fn; // 송신 패킷 암호화용
+    DecryptFunc decrypt_fn; // 수신 패킷 복호화용
 
     /**
-     * ## 서버를 초기화하고 포트를 바인딩한다. (Listen 시작)
+     * ##   서버를 초기화하고 포트를 바인딩한다. (Listen 시작)
      * #### 내부적으로 Epoll 인스턴스와 소켓을 생성한다.
      *
      * ### [Params]
@@ -132,7 +124,7 @@ struct TcpServerContext
     bool ( *Init )( TcpServerContext* ctx, int port );
 
     /**
-     * ## 서버 루프를 실행한다. (Blocking)
+     * ##   서버 루프를 실행한다. (Blocking)
      * #### 워커 스레드와 송신 스레드를 생성하고, 메인 스레드는 Epoll 루프에 진입한다.
      *
      * ### [Params]
@@ -144,7 +136,7 @@ struct TcpServerContext
     void ( *Run )( TcpServerContext* ctx, volatile bool* exit_flag );
 
     /**
-     * ## 특정 클라이언트에게 데이터를 전송하도록 큐에 작업을 등록한다.
+     * ##   특정 클라이언트에게 데이터를 전송하도록 큐에 작업을 등록한다.
      * #### 실제 전송은 Sender 스레드에서 비동기로 처리된다.
      *
      * ### [Params]
@@ -160,7 +152,7 @@ struct TcpServerContext
     bool ( *Send )( TcpServerContext* ctx, int client_fd, const char* target, void* body, int len );
 
     /**
-     * ## 현재 접속된 모든 클라이언트에게 데이터를 전송한다. (Broadcast)
+     * ##   현재 접속된 모든 클라이언트에게 데이터를 전송한다. (Broadcast)
      * #### 내부 관리되는 클라이언트 리스트를 순회하며 전송한다.
      *
      * ### [Params]
@@ -185,7 +177,7 @@ struct TcpServerContext
     void ( *SetStrategy )( TcpServerContext* ctx, EncryptFunc enc, DecryptFunc dec );
 
     /**
-     * ## 서버를 종료하고 자원을 해제한다.
+     * ##   서버를 종료하고 자원을 해제한다.
      * #### 실행 중인 모든 스레드에 종료 신호(Poison Pill)를 보내고 대기한다.
      *
      * ### [Params]
@@ -210,12 +202,11 @@ struct TcpServerContext
  *
  * ### [Param]
  * - callback     : 메시지 수신 시 처리할 콜백 함수
- * - user_arg     : 사용자 정의 데이터 (ServiceContext 등)
- * - worker_count : 생성할 워커 스레드 수 (0 입력 시 기본값 사용)
+ * - service_ctx  : 콜백에 전달될 사용자 데이터 컨텍스트
  *
  * ### [Return]
  * - 생성된 객체 포인터 (실패 시 NULL)
  */
-TcpServerContext* CreateTcpServerContext( OnServerMessageCallback callback, void* user_arg, int worker_count );
+TcpServerContext* CreateTcpServerContext( OnServerMessageCallback callback, void* service_ctx );
 
 #endif // TCP_SERVER_H
